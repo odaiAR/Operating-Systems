@@ -1,0 +1,754 @@
+diff --git a/Makefile b/Makefile
+index 43e152f..2c4f4fd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -50,6 +50,10 @@ endif
+ 
+ QEMU = qemu-system-riscv64
+ 
++ifndef SELECTION
++ SELECTION=SCFIFO
++endif
++
+ CC = $(TOOLPREFIX)gcc
+ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+@@ -62,6 +66,7 @@ CFLAGS += -mcmodel=medany
+ CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
+ CFLAGS += -I.
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++CFLAGS += -D SELECTION=$(SELECTION)
+ 
+ # Disable PIE when possible (for Ubuntu 16.10 toolchain)
+ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
+@@ -133,6 +138,7 @@ UPROGS=\
+ 	$U/_wc\
+ 	$U/_zombie\
+ 	$U/_lazytests\
++	$U/_tests\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index b7802e0..b3f0fba 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -58,6 +58,7 @@ int		        createSwapFile(struct proc* p);
+ int	          	readFromSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size);
+ int		        writeToSwapFile(struct proc* p, char* buffer, uint placeOnFile, uint size);
+ int		        removeSwapFile(struct proc* p);
++int             copySwapFile(struct proc* np);
+ 
+ // ramdisk.c
+ void            ramdiskinit(void);
+@@ -177,6 +178,16 @@ void            uvmfree(pagetable_t, uint64);
+ void            uvmunmap(pagetable_t, uint64, uint64, int);
+ void            uvmclear(pagetable_t, uint64);
+ uint64          walkaddr(pagetable_t, uint64);
++pte_t*          walk(pagetable_t, uint64, int);
++void            swap_in(struct proc*, uint64, pte_t*);
++void            page_to_file(struct proc*, uint);
++int             getIndexToRemove(void);
++int             nfua(struct proc*);
++int             lapa(struct proc*);
++int             scfifo(struct proc*);
++uint            initAging(int);
++void            updateAging();
++uint            getOffset();
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 0e8762f..065059a 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -29,6 +29,18 @@ exec(char *path, char **argv)
+   }
+   ilock(ip);
+ 
++  // Resetting all data
++  for(int i = 0; i < MAX_TOTAL_PAGES; i++){
++    p->data[i].offset = -1;  
++    p->data[i].inUse = 0;
++    p->data[i].agingCounter = 0;
++    p->pages[i] = -1;
++  }
++  p->head = 0;
++  p->numOfPages = 0;
++  p->tail = -1;
++  p->pagesInMemory = 0;
++
+   // Check ELF header
+   if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
+     goto bad;
+diff --git a/kernel/fs.c b/kernel/fs.c
+index a4e4801..b928720 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -20,6 +20,7 @@
+ #include "fs.h"
+ #include "buf.h"
+ #include "file.h"
++#include "fcntl.h"
+ 
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ // there should be one superblock per disk device, but we run with
+@@ -806,4 +807,25 @@ readFromSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size)
+ {
+   p->swapFile->off = placeOnFile;
+   return kfileread(p->swapFile, (uint64)buffer,  size);
++}
++
++int
++copySwapFile(struct proc *np)
++{
++  struct proc *p = myproc();
++  int index;
++  char* buff;
++  for(int i = 0; i < p->sz; i += PGSIZE)
++  {
++    index = i / PGSIZE;
++    if(p->data[index].offset != -1)
++    {
++      if((buff = kalloc()) == 0)
++        return -1;
++      if(readFromSwapFile(p, buff, p->data[index].offset, PGSIZE) > 0)
++        writeToSwapFile(np, buff, p->data[index].offset, PGSIZE);
++      kfree(buff);
++    }
++  }
++  return 0;
+ }
+\ No newline at end of file
+diff --git a/kernel/param.h b/kernel/param.h
+index b5fdcb2..86f6759 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,9 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++#define MAX_PSYC_PAGES 16
++#define MAX_TOTAL_PAGES 32
++#define NFUA 1
++#define LAPA 2
++#define SCFIFO 3
++#define NONE 4
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..7329915 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -141,6 +141,16 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  for(int i = 0; i < MAX_TOTAL_PAGES; i++){
++    p->data[i].offset = -1;  
++    p->data[i].inUse = 0;
++    p->data[i].agingCounter = 0;
++    p->pages[i] = -1;
++  }
++  p->head = 0;
++  p->numOfPages = 0;
++  p->tail = -1;
++  p->pagesInMemory = 0;
+   return p;
+ }
+ 
+@@ -163,6 +173,16 @@ freeproc(struct proc *p)
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
++  for(int i = 0; i < MAX_TOTAL_PAGES; i++){
++    p->data[i].offset = -1;  
++    p->data[i].inUse = 0;
++    p->data[i].agingCounter = 0;
++    p->pages[i] = -1;
++  }
++  p->head = 0;
++  p->numOfPages = 0;
++  p->tail = -1;
++  p->pagesInMemory = 0;
+   p->state = UNUSED;
+ }
+ 
+@@ -306,7 +326,25 @@ fork(void)
+   pid = np->pid;
+ 
+   release(&np->lock);
+-
++  #if SELECTION != NONE
++    if(np->pid > 2) {
++      createSwapFile(np);
++      if(p->swapFile)
++        copySwapFile(np);        
++    }
++  #endif
++  if (p->pid > 2){
++    for(int i = 0; i < MAX_TOTAL_PAGES; i++) {
++      np->data[i].offset = p->data[i].offset;
++      np->data[i].inUse = p->data[i].inUse;
++      np->data[i].agingCounter = p->data[i].agingCounter;
++      np->pages[i] = p->pages[i];
++    }
++    np->head = p->head;
++    np->tail = p->tail;
++    np->numOfPages = p->numOfPages;
++    np->pagesInMemory = p->pagesInMemory;
++  }
+   acquire(&wait_lock);
+   np->parent = p;
+   release(&wait_lock);
+@@ -353,6 +391,9 @@ exit(int status)
+     }
+   }
+ 
++  if(p->pid > 2)
++    removeSwapFile(p);
++
+   begin_op();
+   iput(p->cwd);
+   end_op();
+@@ -454,7 +495,7 @@ scheduler(void)
+         p->state = RUNNING;
+         c->proc = p;
+         swtch(&c->context, &p->context);
+-
++        updateAging();
+         // Process is done running for now.
+         // It should have changed its p->state before coming back.
+         c->proc = 0;
+diff --git a/kernel/proc.h b/kernel/proc.h
+index c007999..e66538c 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -80,6 +80,12 @@ struct trapframe {
+   /* 280 */ uint64 t6;
+ };
+ 
++struct paging_meta_data{
++  uint offset;                // offset in the swapFile
++  uint inUse;                 // which indecates if it's in memory or not
++  uint agingCounter;         // in order to maintain the NFU aging algo
++};
++
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
+ // Per-process state
+@@ -107,4 +113,10 @@ struct proc {
+   char name[16];               // Process name (debugging)
+ 
+   struct file *swapFile;
++  struct paging_meta_data data[MAX_TOTAL_PAGES];
++  uint pagesInMemory;
++  int pages[MAX_TOTAL_PAGES];
++  int head; 
++  int tail;  
++  int numOfPages;
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..a000360 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -331,6 +331,8 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_A (1L << 6)
++#define PTE_PG (1L << 9)
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..5924531 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -65,6 +65,14 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++  } else if(r_scause() == 12 || r_scause() == 13 || r_scause() == 15) {
++    // page fault
++    uint64 va = r_stval();
++    pte_t* pte = walk(p->pagetable, va, 0); 
++    if(pte != 0 && (*pte & PTE_PG))
++      swap_in(p, va, pte); 
++    else 
++      p->killed = 1; //SIGFAULT
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+diff --git a/kernel/vm.c b/kernel/vm.c
+index b47f111..2740e3e 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,6 +5,8 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
++#include "spinlock.h"
++#include "proc.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -156,6 +158,36 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+   return 0;
+ }
+ 
++void in(int page){
++  struct proc * p = myproc();
++  if(p->tail == MAX_TOTAL_PAGES - 1)
++    p->tail = -1;
++  p->tail += 1;
++  p->pages[p->tail] = page;
++  p->numOfPages += 1;
++}
++
++void out(){
++  struct proc* p = myproc();
++  if(p->head == MAX_TOTAL_PAGES - 1)
++    p->head = 0;
++  else
++    p->head += 1;  
++  p->numOfPages -= 1;
++}
++
++// removing all pages and then inserting them again but without the specified page
++void
++removePage(int pageNumber){
++  struct proc * p = myproc();
++  for(int i = 0; i < p->numOfPages; i++){
++    int page = p->pages[p->head];
++    out();
++    if(page != pageNumber)
++      in(page);
++  }
++}
++
+ // Remove npages of mappings starting from va. va must be
+ // page-aligned. The mappings must exist.
+ // Optionally free the physical memory.
+@@ -168,18 +200,35 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+   if((va % PGSIZE) != 0)
+     panic("uvmunmap: not aligned");
+ 
+-  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+-    if((pte = walk(pagetable, a, 0)) == 0)
+-      panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
+-    if(PTE_FLAGS(*pte) == PTE_V)
+-      panic("uvmunmap: not a leaf");
+-    if(do_free){
+-      uint64 pa = PTE2PA(*pte);
+-      kfree((void*)pa);
++  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){    
++    if((pte = walk(pagetable, a, 0)) != 0){
++      if((*pte & PTE_V) != 0){
++        if(PTE_FLAGS(*pte) == PTE_V)
++          panic("uvmunmap: not a leaf");
++        if(do_free){
++          uint64 pa = PTE2PA(*pte);
++          kfree((void*)pa);
++          #if SELECTION != NONE
++            if(a/PGSIZE < 32){
++              // no longer will be in memory
++              myproc()->data[a/PGSIZE].inUse = 0;
++              myproc()->pagesInMemory = (myproc()->pagesInMemory == 0) ? 0 : myproc()->pagesInMemory - 1;
++              myproc()->data[a/PGSIZE].offset = -1;
++              // removing the specified page (not in memory) from the queue
++              removePage(a/PGSIZE);
++            }
++          #endif
++        }
++      }
++      else{
++        #if SELECTION != NONE
++          if(a/PGSIZE < 32)
++            myproc()->data[a/PGSIZE].offset = -1;
++        #endif
++      }
++      // remove it to avoid page out
++      *pte = 0; 
+     }
+-    *pte = 0;
+   }
+ }
+ 
+@@ -215,7 +264,7 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
+ // Allocate PTEs and physical memory to grow process from oldsz to
+ // newsz, which need not be page aligned.  Returns new size or 0 on error.
+ uint64
+-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
++NONE_uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+ {
+   char *mem;
+   uint64 a;
+@@ -240,6 +289,87 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+   return newsz;
+ }
+ 
++// returning the first empty offset for a page that is not in use
++uint
++getOffset()
++{
++  struct proc* p = myproc();
++  uint found = 0;
++  for(int i = 0; i < p->sz && !found; i += PGSIZE){
++    int inUse = 0;
++    for(int j = 0; j < MAX_TOTAL_PAGES && !inUse; j++)
++      if(p->data[j].offset == i)
++        inUse = 1; 
++    if(inUse == 0)
++      return i;
++  }
++  return found;
++}
++
++uint64
++uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
++{
++  #if SELECTION == NONE
++    return NONE_uvmalloc(pagetable, oldsz, newsz);
++  #endif
++  char *mem;
++  uint64 a;
++  struct proc* p = myproc();
++  if(newsz < oldsz)
++    return oldsz;
++
++  oldsz = PGROUNDUP(oldsz);
++  for(a = oldsz; a < newsz; a += PGSIZE){
++    if(p->pid > 1){
++      uint64 numOfPages = a/PGSIZE;
++      if(numOfPages > MAX_TOTAL_PAGES)
++        return -1;
++      if(p->pagesInMemory >= MAX_PSYC_PAGES){
++        page_to_file(p, getOffset());
++        mem = kalloc();
++        if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U) < 0) {
++          uvmdealloc(pagetable, newsz, oldsz);
++          return 0;
++        }
++        p->data[numOfPages].inUse = 1;
++        p->pagesInMemory += 1;
++        p->data[numOfPages].offset = -1;
++        p->data[numOfPages].agingCounter = initAging(numOfPages);
++      }
++      else {
++        mem = kalloc();
++        if(mem == 0){
++          uvmdealloc(pagetable, a, oldsz);
++          return 0;
++        }
++        memset(mem, 0, PGSIZE);
++        if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) < 0){
++          kfree(mem);
++          uvmdealloc(pagetable, a, oldsz);
++          return 0;
++        }
++        p->data[numOfPages].inUse = 1;
++        p->pagesInMemory += 1;
++        p->data[numOfPages].agingCounter = initAging(numOfPages);
++      }
++    }
++    else {
++      mem = kalloc();
++        if(mem == 0){
++          uvmdealloc(pagetable, a, oldsz);
++          return 0;
++        }
++        memset(mem, 0, PGSIZE);
++        if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
++          kfree(mem);
++          uvmdealloc(pagetable, a, oldsz);
++          return 0;
++        }
++    }
++  }
++  return newsz;
++}
++
+ // Deallocate user pages to bring the process size from oldsz to
+ // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
+ // need to be less than oldsz.  oldsz can be larger than the actual
+@@ -302,20 +432,19 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   uint flags;
+   char *mem;
+ 
+-  for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
+-      panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
+-    pa = PTE2PA(*pte);
+-    flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
+-      goto err;
++  for(i = 0; i < sz; i += PGSIZE){    
++    if((pte = walk(old, i, 0)) !=0 && (*pte & PTE_V) != 0){
++      pa = PTE2PA(*pte);
++      flags = PTE_FLAGS(*pte);
++      if((mem = kalloc()) == 0)
++        goto err;
++      memmove(mem, (char*)pa, PGSIZE);
++      if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
++        kfree(mem);
++        goto err;
++      }
+     }
++    
+   }
+   return 0;
+ 
+@@ -429,3 +558,169 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++// Returns the min aging counter pageIndex which it's in use
++int
++nfua(struct proc* p)
++{
++  uint min = (1L << 31);
++  int index = -1;
++  for(int i = 3; i < MAX_TOTAL_PAGES; i++){ 
++    if(p->data[i].inUse && p->data[i].agingCounter < min){
++      min = p->data[i].agingCounter;
++      index = i;
++    }
++  }
++  return index;
++}
++
++// counts the number of 1's in age (GEEKS FOR GEEKS)
++int 
++countOnes(uint age){
++  unsigned int count = 0;
++  while(age){
++    count += age & 1;
++    age >>= 1;
++  }
++  return count;
++}
++
++int 
++lapa(struct proc* p){
++  int minOnes = -1;
++  int minAge = -1;
++  int pageIndex = -1;
++  for(int i = 3; i < MAX_TOTAL_PAGES; i++){
++    if(p->data[i].inUse ){
++      uint age = p->data[i].agingCounter;
++      int numOfOnes = countOnes(age);
++      // if number of 1's is too small * or * it equals and then we take min age
++      if(minOnes == -1 || numOfOnes < minOnes || (numOfOnes == minOnes && age < minAge)){
++        minOnes = numOfOnes;
++        minAge = age;
++        pageIndex = i;
++      }
++    }
++  }
++  return pageIndex;
++}
++
++int
++scfifo(struct proc* p)
++{
++  int page;
++  for(int i = 0; i < p->numOfPages; i++){
++    page = p->pages[p->head];
++    pte_t * pte = walk(p->pagetable, page*PGSIZE, 0);
++    uint pte_flags = PTE_FLAGS(*pte);
++    if((pte_flags & PTE_A)){
++      *pte = *pte & (~PTE_A);
++      out();
++      in(page);
++    }
++    else{ 
++      out();
++      return page;
++    }
++  }
++  page = p->pages[p->head];
++  out();
++  return page;
++}
++
++// By algorithm, returns which page index should we swap to file
++int
++getIndexToRemove(void)
++{
++  #if SELECTION == NFUA
++    struct proc* p = myproc();
++    return nfua(p);
++  #endif
++  #if SELECTION == LAPA
++    struct proc* p = myproc();
++    return lapa(p);
++  #endif
++  #if SELECTION == SCFIFO
++    struct proc* p = myproc();
++    return scfifo(p);
++  #endif
++  return 0;
++}
++
++// swaps a page in ram to the file
++void
++page_to_file(struct proc* p, uint pageOffset)
++{
++  int index = getIndexToRemove();
++  pte_t *pte =  walk(p->pagetable, index*PGSIZE, 0); 
++  uint64 pha = PTE2PA(*pte);
++  if(writeToSwapFile(p, (char*)pha, pageOffset, PGSIZE) < 0)
++    panic("write to file failed");
++  kfree((void*)pha);
++  *pte = (*pte & (~PTE_V)) | PTE_PG;
++  p->data[index].offset = pageOffset;
++  p->data[index].inUse = 0;
++  p->pagesInMemory -= 1;
++}
++
++void
++swap_in(struct proc * p, uint64 va, pte_t* pte)
++{
++  int missingPageIndex = PGROUNDDOWN(va) / PGSIZE;
++  if(p->data[missingPageIndex].offset == -1)
++    panic("Fail in handling page fault");
++  uint pageOffset = p->data[missingPageIndex].offset;
++  char* buff;
++  if((buff = kalloc()) == 0)
++    panic("Fail in kalloc while handling page fault");
++  readFromSwapFile(p, buff, pageOffset, PGSIZE);
++  if(p->pagesInMemory < MAX_PSYC_PAGES) {
++    *pte = PA2PTE((uint64)buff) | PTE_V;
++  }
++  else {
++    page_to_file(p, pageOffset);
++    *pte = PA2PTE((uint64)buff) | ((PTE_FLAGS(*pte) & ~PTE_PG) | PTE_V);
++  }
++  p->data[missingPageIndex].agingCounter = initAging(missingPageIndex);
++  p->data[missingPageIndex].offset = -1;
++  p->data[missingPageIndex].inUse = 1;
++  p->pagesInMemory += 1;
++  sfence_vma();
++}
++
++// initiats aging foreach page inserted in memory
++uint
++initAging(int page)
++{
++  #if SELECTION == NFUA
++    return 0;
++  #endif
++  #if SELECTION == LAPA
++    return 0xFFFFFFFF;
++  #endif
++  #if SELECTION == SCFIFO
++    in(page);
++    return 0;
++  #endif
++  return 0;
++}
++
++// updates the aging counter foreach page when returning to the scheduler
++void
++updateAging(void)
++{
++  #if SELECTION == NFUA || SELECTION == LAPA
++    struct proc* p = myproc();
++    for(int i = 0; i < MAX_TOTAL_PAGES; i++){
++      pte_t* pte = walk(p->pagetable, i*PGSIZE, 0);
++      if(*pte & PTE_V){
++        p->data[i].agingCounter = p->data[i].agingCounter >> 1;
++        // if the page accessed, then it will get high aging counter
++        if(*pte & PTE_A){
++          p->data[i].agingCounter |= (1L << 31);
++          *pte = *pte & (~PTE_A);
++        }
++      }
++    }
++  #endif
++}
+\ No newline at end of file
+diff --git a/user/tests.c b/user/tests.c
+new file mode 100644
+index 0000000..51f00c1
+--- /dev/null
++++ b/user/tests.c
+@@ -0,0 +1,70 @@
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "kernel/syscall.h"
++#include "kernel/memlayout.h"
++#include "kernel/riscv.h"
++#define PAGESIZE 4096
++
++void 
++sanity()
++{
++    char *pages = malloc(PAGESIZE * 20);
++    for(int i = 0; i < 20; i++) {
++        pages[i * PAGESIZE] = i;
++        printf("%d written to page %d\n", i, i);
++    }
++    for (int i = 0; i < 20; i++)
++        printf("reading %d from page %d\n", i, pages[i * PAGESIZE]);
++    free(pages);
++}
++
++void 
++nfua_or_lapa()
++{
++    char *pages = malloc(PAGESIZE * 17);
++    for (int i = 0; i < 16; i++){
++        pages[i * PAGESIZE] = i;
++    }
++    // in order to update aging foreach page
++    sleep(3);
++    for (int i = 0; i < 15; i++){
++        pages[i * PAGESIZE] = i;
++    }
++    sleep(3);
++    pages[16 * PAGESIZE] = 16;
++}
++
++void 
++forkCheck()
++{
++    char *pages = malloc(PAGESIZE * 17);
++    for (int i = 0; i < 17; i++){
++        pages[i * PAGESIZE] = i;
++    }
++    for (int i = 0; i < 17; i++){
++        printf("pages[%d * PG_SIZE] = %d\n", i, pages[i * PAGESIZE]);
++    }
++    int pid = fork();
++    if(pid == 0)
++        for (int i = 0; i < 17; i++)
++            printf("pages[%d * PG_SIZE] = %d\n", i, pages[i * PAGESIZE]);
++    else{
++        int status;
++        wait(&status);
++    }
++}
++
++int 
++main()
++{
++    printf("Start Running Tests:\n");
++    sanity();
++    nfua_or_lapa();
++    forkCheck();
++    exit(0);
++    printf("Everything is Done.\n");
++}
